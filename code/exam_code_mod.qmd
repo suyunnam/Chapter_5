@@ -1,0 +1,679 @@
+---
+title: "Chapter 5. Estimating quantum yield of PSII using Environ data"
+author: "Suyun Nam"
+date: "04.11.2025"
+format: html
+---
+
+# Objectives
+Develop a machine learning analysis to create models that predict quantum yield of PSII for red lettuce as a function of meteorological variables
+
+Meteorological variables to use
+1) ePPFD (4 rep; 15 min averaged & Instantaneous)
+2) PPFD (4 rep; 15 min averaged & Instantaneous)
+3) Temperature (4 rep)
+4) Relative humidity
+5) Vapor pressure deficit
+6) CO2 level
+
+
+# Libraries
+```{r}
+# Loading packages
+library(readxl)      # reading excel file
+library(tidyverse)   # data wrangling and plotting
+library(tidymodels)  # ML workflows
+library(lubridate)   # working with dates and times
+library(ggcorrplot)  # correlation matrix plots
+library(broom)       # model coefficient organizing
+library(vip)         # variable importance plotting
+library(car)         # multicolinearity check
+```
+
+
+# Import data
+## Import Environ data
+```{r}
+# Import the original excel file
+environ_excel <- read_excel("../data/environ_excel.xlsx")
+environ_excel
+
+# Save each sheet as csv file
+write.csv(environ_excel, file = "../data/environ.csv", row.names = FALSE)
+environ <- read_csv("../data/environ.csv")
+environ
+```
+
+## Import CF data
+```{r}
+# Import the original excel file
+cf_excel <- read_excel("../data/cf_excel.xlsx")
+cf_excel
+
+# Save each sheet as csv file
+write.csv(cf_excel, file = "../data/cf.csv", row.names = FALSE)
+cf <- read_csv("../data/cf.csv")
+cf
+```
+
+
+# Wrangling data
+## CF
+Round time to 15-min interval and remove night time data (cf)
+```{r}
+cf_dfw <- cf %>%
+  mutate(time = round_date(time, unit = "15 minutes")) %>%                                
+  filter(format(time, "%H:%M") >= "06:00" & format(time, "%H:%M") <= "20:45")
+
+cf_dfw
+```
+
+## Environ
+```{r}
+environ_dfw <- environ %>%
+  filter(format(time, "%H:%M") >= "06:00" & format(time, "%H:%M") <= "20:30")
+
+environ_dfw
+```
+
+
+## Match time
+Before we merge the file, check if both time frames are identical
+```{r}
+# Get unique time values from both data sets
+environ_time <- unique(environ_dfw$time)
+cf_time <- unique(cf_dfw$time)
+
+# Check if all values are in each other
+all_in_cf <- all(environ_time %in% cf_time) # Are all times in environ in cf?
+all_in_environ <- all(cf_time %in% environ_time) # Are all times in cf in environ?
+
+# Print results
+if (all_in_cf && all_in_environ) {
+  print("The time_15min columns in both datasets are identical.")
+} else {
+  print("The time_15min columns have differences.")
+}
+
+```
+The two time columns are identical! Now I can merge them
+
+
+## Merge
+```{r}
+merged <- cf_dfw %>%
+  left_join(environ_dfw, by = "time")%>%  
+  relocate(time, .before = qy_1) %>%  
+  drop_na() # remove the first row having NA
+
+write_csv(merged, "../data/merged.csv") 
+merged
+```
+
+## Long format
+```{r}
+merged_long <- merged %>%
+  pivot_longer(
+    cols = -c(time, vpd, co2),
+    names_to = c(".value", "loc"),
+    names_pattern = "(.*)_(\\d)") %>%
+  mutate(loc = as.integer(loc))
+
+merged_long
+```
+
+
+# EDA
+Check how the environmental variables are related.
+
+## Correlation plot
+```{r}
+# Estimating significance matrix
+p.mat <- merged_long %>%
+  dplyr::select(-time, -qy, -loc) %>%  # leave explanatory variables only
+  cor_pmat()  # compute p-values for the correlations
+
+p.mat
+
+# Correlation plot
+merged_long %>%
+  dplyr::select(-time, -qy, -loc) %>%
+  cor() %>%
+  ggcorrplot(hc.order = TRUE, 
+             digits = 1,
+             type = "lower", 
+             p.mat = p.mat, 
+             sig.level = 0.05,
+             insig = "blank",
+             lab = TRUE)
+
+# save the image file
+ggsave("../output/corrmat.png",
+       height = 6,
+       width = 6,
+       bg = "white")
+```
+
+## Bivariate relationship
+Check how the parameters are related to the response variable
+```{r}
+merged_long %>%
+  dplyr::select(-time, -loc) %>%
+  pivot_longer(cols=-qy) %>%
+  group_by(name) %>%
+  nest() %>%
+  mutate(r2 = map_dbl(data,
+                  ~lm(qy ~ value,
+                      data = .x) %>%
+                    glance(.) %>%
+                    pull(r.squared)
+                  )) %>%
+  arrange(desc(r2))
+```
+
+Let's check it with R2 plots
+```{r}
+merged_long %>%
+  dplyr::select(-time, -loc) %>%
+  pivot_longer(cols=-qy) %>%
+  group_by(name) %>%
+  nest() %>%
+  mutate(r2 = map_dbl(data,
+                  ~lm(qy ~ value,
+                      data = .x) %>%
+                    glance(.) %>%
+                    pull(r.squared)
+                  )) %>%
+  arrange(desc(r2)) %>%
+  ungroup() %>%
+  unnest(data) %>%
+  ggplot(aes(x = value, 
+             y = qy))+
+  geom_point(shape = 21, 
+             alpha = .7, 
+             fill = "purple")+
+  geom_smooth(method = "lm", 
+              se = F, 
+              color = "black", 
+              size = 1)+
+  facet_wrap(~name, 
+             scales = "free_x", 
+             ncol=2) 
+```
+
+## Visualize multicollinearity
+Pick two correlated and uncorrelated variable sets, and plot them.
+```{r}
+merged_long %>%
+  ggplot(aes(x = temp, 
+             y = co2)) +
+  geom_point() +
+  geom_smooth(method="lm") 
+```
+
+
+Correlated each other the most
+```{r}
+merged_long %>%
+  ggplot(aes(x = ppfdi, 
+             y = eppfdi)) +
+  geom_point() +
+  geom_smooth(method="lm") 
+```
+Highly correlated variables are aligned together
+
+
+# Linear Regression models
+## 1. Put all
+Too high multicollinearity
+```{r}
+mod_lm1 <- lm(qy ~ ppfd + eppfd + ppfdi + eppfdi + temp + vpd + co2, data = merged_long)
+vif(mod_lm1)
+```
+## 2. PPFDs only
+```{r}
+mod_lm2 <- lm(qy ~ ppfd + ppfdi + temp + vpd + co2, data = merged_long)
+vif(mod_lm2)
+summary(mod_lm2)
+```
+## 3. ePPFD only
+```{r}
+mod_lm3 <- lm(qy ~ eppfd + eppfdi + temp + vpd + co2, data = merged_long)
+vif(mod_lm3)
+```
+## 4. PPFD
+```{r}
+mod_lm4 <- lm(qy ~ ppfd + temp + vpd + co2, data = merged_long)
+vif(mod_lm4)
+```
+
+## 5. PPFDi
+```{r}
+mod_lm5 <- lm(qy ~ ppfdi + temp + vpd + co2, data = merged_long)
+vif(mod_lm5)
+summary(mod_lm5)
+```
+## 6. ePPFD
+```{r}
+mod_lm6 <- lm(qy ~ eppfd + temp + vpd + co2, data = merged_long)
+vif(mod_lm6)
+```
+
+## 7. ePPFDi
+```{r}
+mod_lm7 <- lm(qy ~ eppfdi + temp + vpd + co2, data = merged_long)
+vif(mod_lm7)
+```
+# Model comparison
+```{r}
+lm2_comp <- tibble(
+  model = "mod_lm2",
+  r2 = summary(mod_lm2)$r.squared,
+  rmse = sqrt(mean((merged_long$qy - predict(mod_lm2))^2)),
+  aic = AIC(mod_lm2),
+  bic = BIC(mod_lm2))
+lm2_comp
+
+lm3_comp <- tibble(
+  model = "mod_lm3",
+  r2 = summary(mod_lm3)$r.squared,
+  rmse = sqrt(mean((merged_long$qy - predict(mod_lm3))^2)),
+  aic = AIC(mod_lm3),
+  bic = BIC(mod_lm3))
+lm3_comp
+
+lm4_comp <- tibble(
+  model = "mod_lm4",
+  r2 = summary(mod_lm4)$r.squared,
+  rmse = sqrt(mean((merged_long$qy - predict(mod_lm4))^2)),
+  aic = AIC(mod_lm4),
+  bic = BIC(mod_lm4))
+lm4_comp
+
+lm5_comp <- tibble(
+  model = "mod_lm5",
+  r2 = summary(mod_lm5)$r.squared,
+  rmse = sqrt(mean((merged_long$qy - predict(mod_lm5))^2)),
+  aic = AIC(mod_lm5),
+  bic = BIC(mod_lm5))
+lm5_comp
+
+lm6_comp <- tibble(
+  model = "mod_lm6",
+  r2 = summary(mod_lm6)$r.squared,
+  rmse = sqrt(mean((merged_long$qy - predict(mod_lm6))^2)),
+  aic = AIC(mod_lm6),
+  bic = BIC(mod_lm6))
+lm6_comp
+
+lm7_comp <- tibble(
+  model = "mod_lm7",
+  r2 = summary(mod_lm7)$r.squared,
+  rmse = sqrt(mean((merged_long$qy - predict(mod_lm7))^2)),
+  aic = AIC(mod_lm7),
+  bic = BIC(mod_lm7))
+lm7_comp
+
+model_comparison <- bind_rows(lm2_comp, lm3_comp, lm4_comp, lm5_comp, lm6_comp, lm7_comp)
+model_comparison
+
+model_comparison %>% arrange(rmse)
+model_comparison %>% arrange(desc(r2))
+model_comparison %>% arrange(aic)
+model_comparison %>% arrange(bic)
+```
+# Pick mod_lm2 (ppfd + ppfdi)
+## Residual, normality check
+```{r}
+par(mfrow = c(2, 2))
+plot(mod_lm3)
+```
+
+## Equation coefficients
+```{r}
+summary(mod_lm3)$coefficients
+```
+
+## Measured vs Predicted
+```{r}
+merged_long$pred_mod3 <- predict(mod_lm3)
+
+ggplot(merged_long, aes(x = qy, y = pred_mod3)) +
+  geom_point(alpha = 0.6) +
+  geom_abline(slope = 1, intercept = 0, color = "red") +
+  labs(x = "Measured QY", y = "Predicted QY") +
+  theme_minimal()
+```
+
+# Data split
+Four models will share the same splited data
+ - 70% training
+ - 30% testing
+
+```{r}
+set.seed(931735)
+
+merged_split <- initial_split(merged_long, prop = .7)
+merged_split
+```
+
+```{r}
+merged_train <- training(merged_split)
+merged_train
+```
+
+```{r}
+merged_test <- testing(merged_split)
+merged_test
+```
+Put "test set" aside and continue with the "train set" for taining.
+
+
+# 1. ePPFDs: Model evaluation
+## Create a recipe
+```{r}
+lm_recipe <- recipe(qy ~ eppfd + eppfdi + temp + vpd + co2, data = merged_train)
+```
+
+## Model specification
+```{r}
+lm_spec <- linear_reg() %>%
+  set_engine("lm") %>%
+  set_mode("regression")
+```
+
+## Combine recipe and spec
+```{r}
+lm_workflow <- workflow() %>%
+  add_recipe(lm_recipe) %>%
+  add_model(lm_spec)
+```
+
+## Cross-validation
+```{r}
+set.seed(34549)
+folds <- vfold_cv(merged_train, v = 5)
+
+lm_cv_results <- lm_workflow %>%
+  fit_resamples(resamples = folds,
+                metrics = metric_set(rmse, rsq, mae))
+
+collect_metrics(lm_cv_results)
+```
+
+## Evaluation
+```{r}
+lm_final_fit <- last_fit(
+  lm_workflow,
+  split = merged_split,
+  metrics = metric_set(rmse, rsq, mae))
+
+collect_metrics(lm_final_fit)
+```
+
+## Prediction vs Observed
+```{r}
+collect_predictions(lm_final_fit) %>%
+  ggplot(aes(x = qy, y = .pred)) +
+  geom_point(alpha = 0.6) +
+  geom_abline(color = "red") +
+  labs(x = "Measured QY", y = "Predicted QY") +
+  theme_minimal()
+```
+
+## Residual check
+```{r}
+lm_final_fit %>%
+  collect_predictions() %>%
+  mutate(residual = qy - .pred) %>%
+  ggplot(aes(x = .pred, y = residual)) +
+  geom_point(alpha = 0.6) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  labs(x = "Predicted QY", y = "Residual") +
+  theme_minimal()
+```
+
+## Coefficients
+```{r}
+lm_final_fit$.workflow[[1]] %>%
+  tidy()
+```
+
+## Variable importance
+```{r}
+# New recipe for normalize parameters
+lm_recipe_scaled <- recipe(qy ~ eppfd + eppfdi + temp + vpd + co2, data = merged_train) %>%
+  step_normalize(all_predictors())
+
+lm_workflow_scaled <- workflow() %>%
+  add_recipe(lm_recipe_scaled) %>%
+  add_model(lm_spec)
+
+lm_final_fit_scaled <- last_fit(lm_workflow_scaled, split = merged_split)
+
+lm_final_fit_scaled$.workflow[[1]] %>%
+  extract_fit_parsnip() %>%
+  vip(num_features = 10)    
+```
+
+# 2. ePPFDi only: Model evaluation
+## Create a recipe
+```{r}
+lm_recipe_2 <- recipe(qy ~ eppfdi + temp + vpd + co2, data = merged_train)
+```
+
+## Combine recipe and spec
+```{r}
+lm_workflow_2 <- workflow() %>%
+  add_recipe(lm_recipe_2) %>%
+  add_model(lm_spec)
+```
+
+## Cross-validation
+```{r}
+set.seed(34549)
+folds <- vfold_cv(merged_train, v = 5)
+
+lm_cv_results_2 <- lm_workflow_2 %>%
+  fit_resamples(resamples = folds,
+                metrics = metric_set(rmse, rsq, mae))
+
+collect_metrics(lm_cv_results_2)
+```
+
+## Evaluation
+```{r}
+lm_final_fit_2 <- last_fit(
+  lm_workflow_2,
+  split = merged_split,
+  metrics = metric_set(rmse, rsq, mae))
+
+collect_metrics(lm_final_fit_2)
+```
+
+## Prediction vs Observed
+```{r}
+collect_predictions(lm_final_fit_2) %>%
+  ggplot(aes(x = qy, y = .pred)) +
+  geom_point(alpha = 0.6) +
+  geom_abline(color = "red") +
+  labs(x = "Measured QY", y = "Predicted QY") +
+  theme_minimal()
+```
+
+
+## Residual check
+```{r}
+lm_final_fit_2 %>%
+  collect_predictions() %>%
+  mutate(residual = qy - .pred) %>%
+  ggplot(aes(x = .pred, y = residual)) +
+  geom_point(alpha = 0.6) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  labs(x = "Predicted QY", y = "Residual") +
+  theme_minimal()
+```
+
+## Coefficients
+```{r}
+lm_final_fit_2$.workflow[[1]] %>%
+  tidy()
+```
+
+## Variable importance
+```{r}
+# New recipe for normalize parameters
+lm_recipe_scaled_2 <- recipe(qy ~ eppfdi + temp + vpd + co2, data = merged_train) %>%
+  step_normalize(all_predictors())
+
+lm_workflow_scaled_2 <- workflow() %>%
+  add_recipe(lm_recipe_scaled_2) %>%
+  add_model(lm_spec)
+
+lm_final_fit_scaled_2 <- last_fit(lm_workflow_scaled_2, split = merged_split)
+
+lm_final_fit_scaled_2$.workflow[[1]] %>%
+  extract_fit_parsnip() %>%
+  vip(num_features = 10)    
+```
+
+
+# 3. Quadratic check
+## Visual check
+```{r}
+library(ggplot2)
+
+ggplot(merged_long, aes(x = temp, y = qy)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "lm", formula = y ~ x, se = FALSE, color = "blue", linetype = "dashed") +  
+  geom_smooth(method = "lm", formula = y ~ poly(x, 2), se = FALSE, color = "red") +                
+  labs(title = "QY vs Temperature: Linear vs Quadratic",
+       x = "Temperature (°C)",
+       y = "Quantum Yield (QY)") +
+  theme_minimal()
+```
+
+# Quadratic Model with all data
+```{r}
+mod_quad <- lm(qy ~ eppfd + eppfdi + temp + I(temp^2) + vpd + co2, data = merged_long)
+vif(mod_quad)
+```
+## Recipe and Workflow
+```{r}
+lm_recipe_quad <- recipe(qy ~ eppfd + eppfdi + temp + vpd + co2, data = merged_train) %>%
+  step_mutate(temp2 = temp^2)
+
+lm_workflow_quad <- workflow() %>%
+  add_recipe(lm_recipe_quad) %>%
+  add_model(lm_spec)
+```
+
+## cross validation
+```{r}
+set.seed(34549)
+folds <- vfold_cv(merged_train, v = 5)
+
+lm_cv_results_quad <- lm_workflow_quad %>%
+  fit_resamples(resamples = folds,
+                metrics = metric_set(rmse, rsq, mae))
+
+collect_metrics(lm_cv_results_quad)
+```
+
+## Evaluation
+```{r}
+lm_final_fit_quad <- last_fit(
+  lm_workflow_quad,
+  split = merged_split,
+  metrics = metric_set(rmse, rsq, mae))
+
+collect_metrics(lm_final_fit_quad)
+```
+## Prediction vs Observed
+```{r}
+collect_predictions(lm_final_fit_quad) %>%
+  ggplot(aes(x = qy, y = .pred)) +
+  geom_point(alpha = 0.6) +
+  geom_abline(color = "red") +
+  labs(x = "Measured QY", y = "Predicted QY") +
+  theme_minimal()
+```
+
+## Residual check
+```{r}
+lm_final_fit_quad %>%
+  collect_predictions() %>%
+  mutate(residual = qy - .pred) %>%
+  ggplot(aes(x = .pred, y = residual)) +
+  geom_point(alpha = 0.6) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  labs(x = "Predicted QY", y = "Residual") +
+  theme_minimal()
+```
+
+## Coefficients
+```{r}
+lm_final_fit_quad$.workflow[[1]] %>%
+  tidy()
+```
+## Variable importance
+```{r}
+lm_recipe_quad_scaled <- recipe(qy ~ eppfd + eppfdi + temp + vpd + co2, data = merged_train) %>%
+  step_mutate(temp2 = temp^2) %>%
+  step_normalize(all_predictors())  
+
+lm_workflow_quad_scaled <- workflow() %>%
+  add_recipe(lm_recipe_quad_scaled) %>%
+  add_model(lm_spec)
+
+lm_final_fit_quad_scaled <- last_fit(lm_workflow_quad_scaled, split = merged_split)
+
+lm_final_fit_quad_scaled$.workflow[[1]] %>%
+  extract_fit_parsnip() %>%
+  vip(num_features = 10)
+```
+
+
+## k
+```{r}
+
+```
+
+
+## k
+```{r}
+
+```
+
+
+## k
+```{r}
+
+```
+
+
+## k
+```{r}
+
+```
+
+
+## k
+```{r}
+
+```
+
+
+## k
+```{r}
+
+```
+
+
+## k
+```{r}
+
+```
+
+
+
