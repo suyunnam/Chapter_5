@@ -1,0 +1,203 @@
+---
+title: "Chapter 5. Estimating quantum yield of PSII using Environ data"
+author: "Suyun Nam"
+date: "04.30.2025"
+format: html
+---
+
+# Objectives
+Develop a machine learning analysis to create models that predict quantum yield of PSII for red lettuce as a function of meteorological variables
+
+Meteorological variables to use
+1) ePPFD (4 rep; 15 min averaged & Instantaneous)
+2) PPFD (4 rep; 15 min averaged & Instantaneous)
+3) Temperature
+4) Vapor pressure deficit
+5) CO2 level
+
+Secondary variables
+- DLI until now
+- eDLI until now
+
+
+# Fix directoroy to "Chapter_5"
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = normalizePath("../.."))
+```
+
+# Libraries
+```{r}
+# Loading packages
+library(readxl)      # reading excel file
+library(tidyverse)   # data wrangling and plotting
+library(tidymodels)  # ML workflows
+library(lubridate)   # working with dates and times
+library(ggcorrplot)  # correlation matrix plots
+library(broom)       # model coefficient organizing
+library(vip)         # variable importance plotting
+library(car)         # multicolinearity check
+library(glmnet)      # elastic net
+```
+
+# Import data
+## Import Environ data
+```{r}
+# Import the original excel file
+environ_raw <- read_excel("data/0422/environ_excel.xlsx")
+environ_raw
+
+# Save each sheet as csv file
+write.csv(environ_raw, file = "data/0422/environ.csv", row.names = FALSE)
+environ <- read_csv("data/0422/environ.csv")
+environ
+```
+
+## Import CF data
+```{r}
+# Import the original excel file
+cf_excel <- read_excel("data/0422/cf_excel.xlsx")
+cf_excel
+
+# Save each sheet as csv file
+write.csv(cf_excel, file = "data/0422/cf.csv", row.names = FALSE)
+cf <- read_csv("data/0422/cf.csv")
+cf
+```
+
+
+# Wrangling data
+## CF
+Round time to 15-min interval and remove night time data (cf)
+```{r}
+cf_dfw <- cf %>%
+  mutate(time = round_date(time, unit = "15 minutes")) %>%                                
+  filter(format(time, "%H:%M") >= "07:00" & format(time, "%H:%M") <= "20:45")
+
+cf_dfw
+```
+
+## Environ
+```{r}
+environ_dfw <- environ %>%
+  filter(format(time, "%H:%M") >= "07:00" & format(time, "%H:%M") <= "20:30")
+
+environ_dfw
+```
+
+
+## Match time
+Before we merge the file, check if both time frames are identical
+```{r}
+# Get unique time values from both data sets
+environ_time <- unique(environ_dfw$time)
+cf_time <- unique(cf_dfw$time)
+
+# Check if all values are in each other
+all_in_cf <- all(environ_time %in% cf_time) # Are all times in environ in cf?
+all_in_environ <- all(cf_time %in% environ_time) # Are all times in cf in environ?
+
+# Print results
+if (all_in_cf && all_in_environ) {
+  print("The time_15min columns in both datasets are identical.")
+} else {
+  print("The time_15min columns have differences.")
+}
+
+```
+The two time columns are identical! Now I can merge them
+
+
+## Merge
+```{r}
+merged <- cf_dfw %>%
+  left_join(environ_dfw, by = "time")%>%  
+  relocate(time, .before = qy_1) %>%  
+  drop_na() # remove the first row having NA
+
+merged
+```
+
+## Add DLI variable
+```{r}
+merged <- merged %>%
+  mutate(date = as_date(time)) %>%
+  group_by(date) %>%
+  mutate(
+    edli_1 = cumsum(eppfd_1) * 900 / 1e6,
+    edli_2 = cumsum(eppfd_2) * 900 / 1e6,
+    edli_3 = cumsum(eppfd_3) * 900 / 1e6,
+    edli_4 = cumsum(eppfd_4) * 900 / 1e6,
+    dli_1  = cumsum(ppfd_1) * 900 / 1e6,
+    dli_2  = cumsum(ppfd_2) * 900 / 1e6,
+    dli_3  = cumsum(ppfd_3) * 900 / 1e6,
+    dli_4  = cumsum(ppfd_4) * 900 / 1e6
+  ) %>%
+  ungroup()
+
+merged
+write_csv(merged, "data/0422/merged.csv") 
+```
+
+## Long format
+```{r}
+merged_long <- merged %>%
+  pivot_longer(
+    cols = -c(time, temp, vpd, co2, eppfd_g, eppfdi_g, date),
+    names_to = c(".value", "loc"),
+    names_pattern = "(.*)_(\\d)") %>%
+  mutate(loc = as.integer(loc))
+
+merged_long
+```
+
+
+# a. Data split
+Four models will share the same splited data
+ - 70% training
+ - 30% testing
+
+```{r}
+set.seed(931735)
+
+merged_split <- initial_split(merged_long, prop = .7)
+merged_split
+```
+
+```{r}
+merged_train <- training(merged_split)
+merged_train
+```
+
+```{r}
+merged_test <- testing(merged_split)
+merged_test
+```
+Put "test set" aside and continue with the "train set" for taining.
+
+
+# b. Data processing  
+```{r}
+elastic_recipe <-
+  # Defining predicted and predictor variables
+  recipe(qy ~  .,
+         data = merged_train) %>%
+  # Removing year and site  
+  step_rm(time, date, loc) %>%    
+  
+  # Normalizing all numeric variables except predicted variable
+  step_normalize(all_numeric(), -all_outcomes())
+  
+elastic_recipe
+```
+
+```{r weather_prep}
+elastic_prep <- weather_recipe %>%
+  prep()
+
+weather_prep
+```
+
+
+
+
+

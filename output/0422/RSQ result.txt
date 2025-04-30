@@ -1,0 +1,5 @@
+- ePPFD: 0.5515
+- Quadratic ePPFD: 0.5514
+- ePPFDi: 0.5429
+- ePPFD + ePPFDi: 0.5770
+- ePPFDi + PPFDi: 0.5460
