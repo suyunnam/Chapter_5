@@ -3,3 +3,5 @@
 - ePPFDi: 0.5429
 - ePPFD + ePPFDi: 0.5770
 - ePPFDi + PPFDi: 0.5460
+
+- elastic net: 0.693
